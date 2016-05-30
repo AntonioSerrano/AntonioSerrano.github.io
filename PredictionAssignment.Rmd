@@ -1,0 +1,250 @@
+---
+title: "Prediction Assignment Writeup"
+author: "Antonio Serrano"
+date: "May 29, 2016"
+output: html_document
+---
+
+* Index:
+    + [Abstract](#abstract)
+    + [1. Introduction](#introduction)
+    + [2. Data processing](#data-processing)
+    + [3. Feature selection](#feature-selection)
+    + [4. Model estimate](#model-estimate)
+    + [5. File submission](#file-submission)
+
+## It is not about quantity but quality: assessing fitness activity performance in the context of the Quantified Self Movement
+
+### Abstract
+
+Research on activity recognition has traditionally focused on discriminating between different activities, i.e. to predict “which” activity was performed at a specific point in time. The quality of executing an activity, the “how (well)”, has only received little attention so far, even though it potentially provides useful information for a large variety of applications. To address this gap in the literature, we propose the following analysis to qualitatively assess and provide feedback on weight lifting exercises. In particular, this study evaluates the performance of 6 participants using data from sensors installed on their belts, forearms, arms, and dumbbells. The results underline that learning machine algorithms can also be used to predict with a reasonable accuracy how well weight lifting exercises are performed.
+
+### 1. Introduction
+
+This document was written to complete the assignment "Prediction assignment writeup" in the context of the Practical Machine Learning course as part of the Data Science Specialization offered by Johns Hopkins University via Coursera.org. Special thanks go to the Brazilian group of research and development of groupware technologies "Groupware@LES" (http://groupware.les.inf.puc-rio.br/har) for providing the necessary data for this analysis. The mentioned data set was originally employed in Velloso et al. (2013).
+
+```{r, message = FALSE, warning = FALSE}
+
+## General settings:
+
+echo = TRUE  # To make code always visible
+options(scipen = 10000)  # Turn off scientific notations for numbers
+
+## Create "usePackage" function to install and load packages automatically:
+
+usePackage <- function(p) 
+{
+  if (!is.element(p, installed.packages()[,1]))
+    install.packages(p, dep = TRUE)
+  require(p, character.only = TRUE)
+}
+
+## Load packages:
+
+usePackage("data.table") # For reading data set
+usePackage("dplyr") # For data cleaning
+usePackage("parallel") # For using multiple cores on our machine (if applicable)
+usePackage("doParallel")
+usePackage("caret") # For learning machine predictions
+
+## Check session info for reproducibility:
+
+sessionInfo()
+
+```
+
+### 2. Data Processing
+
+#### 2.1 Download and read data sets
+
+```{r, warning = FALSE, message = FALSE, cache = TRUE}
+
+## Download the training and testing files from the Internet:
+
+if(!file.exists("/.preTraining.csv")){
+        download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv",
+                      destfile= "./preTraining.csv", method = "curl")
+}
+
+if(!file.exists("/.validation.csv")){
+        download.file(url = "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv",
+                      destfile= "./validation.csv", method = "curl")
+}
+
+## Read data set using the "fread" function from "data.table" package. It is much faster than "read.table":
+
+preTraining <- fread(input = "./preTraining.csv",
+            header = TRUE,
+            sep = ",")
+
+validation <- fread(input = "./validation.csv",
+            header = TRUE,
+            sep = ",")
+
+## Check data sets dimensions and structure:
+
+dim(preTraining) # 19622 rows x 159 columns
+dim(validation) # 20 x 159
+str(preTraining)
+
+```
+
+#### 2.2 Data cleaning
+
+```{r, warning = FALSE, message = FALSE}
+
+## Counting missing values per column in the "preTraining" data frame:
+
+sapply(preTraining, function(x) sum(is.na(x)))
+
+```
+
+It turns out that there are several variables/columns that have many missing values (19,216 out of 19,622). The other variables do not have any missing value. Thus, we will select those variables related to belt, forearm, arm, and dumbbell that do not have any missing value in the data sets:
+
+```{r, warning = FALSE, message = FALSE}
+
+## Check if there is any missing value in each column and return a vector with that piece of information:
+
+isNApreTraining <- sapply(preTraining, function (x) any(is.na(x) | x == ""))
+isNAvalidation <- sapply(validation, function (x) any(is.na(x) | x == ""))
+
+## Create an index of belt, forearm, arm, and dumbbell variables that do not have any missing value:
+
+isFeaturePreTraining <- !isNApreTraining & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(isNApreTraining)) 
+featuresPreTraining <- names(isNApreTraining)[isFeaturePreTraining]
+isFeatureValidation <- !isNAvalidation & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(isNAvalidation))
+featuresValidation <- names(isNAvalidation)[isFeatureValidation]
+
+## Apply the index to get the filtered "features" data frame:
+
+featuresDFpreTraining <- subset(preTraining, select = featuresPreTraining)
+validation <- subset(validation, select = c("problem_id", featuresValidation))
+
+## Sort columns in data frames alphabetically:
+
+featuresDFpreTraining <- featuresDFpreTraining %>% select(noquote(order(colnames(featuresDFpreTraining))))
+validation <- validation %>% select(noquote(order(colnames(validation))))
+
+## Create clean data frame for preTraining:
+
+preTraining <- data.frame(preTraining$classe, featuresDFpreTraining)
+colnames(preTraining)[1] <- "classe"
+
+## Checking dimensions of new data frames:
+
+dim(preTraining) # 19622 x 53
+dim(validation) # 20 x 52
+
+```
+
+#### 2.3 Data partition
+
+```{r, warning = FALSE, message = FALSE}
+
+## Split the preTraining data set. 60% goes to training and 40% goes to testing data set:
+
+set.seed(125)
+inTrain <- createDataPartition(preTraining$classe, p = 0.6, list = FALSE)
+training <- preTraining[inTrain,]
+testing <- preTraining[-inTrain,]
+
+```
+
+### 3. Feature selection
+
+There exist several strategies for features selection: criteria based on correlations, on importance, automatic methods like Recursive Feature Elimination (RFE), etc. The paper from Velloso et al. (2013) says that they "used the feature selection algorithm based on correlation proposed by Hall. The algorithm was configured to use a “Best First” strategy based on backtracking. 17 features were selected". However, I was not able to find any package in R based on that technique. Moreover, other algorithms based on “Best First” search were too complicated considering my humble background in learning machine. That is why I decided to use the RFE method.
+
+```{r, warning = FALSE, message = FALSE, cache = TRUE, fig.align = "center", fig.width = 12, fig.height = 8, dpi = 72}
+
+## Set seed:
+
+set.seed(125)
+
+## Preparing multiple core computing:
+
+cl <- makeCluster(detectCores())
+registerDoParallel(cl)
+
+## Define control using a random forest selection function, including k-fold cross validation (k = 10):
+
+control <- rfeControl(functions = rfFuncs,
+                      method = "cv",
+                      number = 10,
+                      allowParallel = TRUE,
+                      verbose = TRUE)
+
+# Run the RFE algorithm (it is going to take a while, be patient...)
+
+results <- rfe(training[,2:ncol(training)], training$classe, sizes = c(2:ncol(training)), rfeControl = control)
+
+## Summarize the results:
+print(results)
+
+## List the chosen features:
+
+predictors <- predictors(results)[1:10] # We chose the first ten predictors with an accuracy of 0.9832. Less variables means more speed computationally speaking
+
+## Plot the results:
+
+plot(results, type=c("g", "o"))
+
+```
+
+### 4. Model estimate
+
+```{r, warning = FALSE, message = FALSE, cache = TRUE}
+
+## Set the control parameters:
+
+trainctrl <- trainControl(method = "cv",
+                          number = 10,
+                          allowParallel = TRUE,
+                          verboseIter = TRUE)
+
+## Fit random forest model:
+
+ModFit <- train(classe ~ roll_belt + yaw_belt + magnet_dumbbell_z + magnet_dumbbell_y + pitch_belt + pitch_forearm + roll_forearm + accel_dumbbell_y + roll_dumbbell + roll_arm, method = "rf", data = training, trControl = trainctrl)
+
+ModFit$finalModel
+
+## Compare training predictions with testing predictions:
+
+predTesting <- predict(ModFit, newdata = testing)
+
+## Calculate confusion matrix:
+
+M1 <- confusionMatrix(predTesting, testing$classe)
+
+## Print out-of sample accuracy:
+
+M1$overall[1]
+
+## 0.9824114. It means we got a very accurate estimate :)
+
+## Predict on validation data:
+
+predValidation <- predict(ModFit, newdata = validation)
+predValidation
+
+## Stop cluster for multiple core computing:
+
+stopCluster(cl)
+
+```
+
+### 5. File submission
+
+```{r, warning = FALSE, message = FALSE}
+
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+
+pml_write_files(predValidation)
+
+```
+
